@@ -1,0 +1,111 @@
+- hosts: localhost
+  # ansible-playbook -i inventory.yml playbooks/chgm.yaml --extra-vars "CAD_PD_API_KEY=$(CAD_PD_API_KEY)"
+  name: Investigate missing cluster (chgm)
+  connection: local
+  vars:
+    - aws_region: us-east-2
+    - incident_id: "Q0C29A8JYRX65H" # payload.events.data.
+    - incident_key: "{{ incident_key }}"
+  
+  tasks:
+    
+    - name: Log incident 
+      ansible.builtin.debug:
+        msg: "{{ CAD_PD_API_KEY }}"
+    
+    - name: Get pd incident details 
+      ansible.builtin.uri:
+        url: 'https://api.pagerduty.com/incidents/{{ incident_id }}?include%5B%5D=body'
+        method: 'GET'
+        headers:
+          Authorization: Token token={{ CAD_PD_API_KEY }}
+          Accept: application/json
+          Content-Type: application/json
+      register: incident_get
+  
+    - name: Log incident 
+      ansible.builtin.debug:
+        msg: "{{ incident_get }}"
+
+    - name: Get access to cloud infra 
+      ansible.builtin.command:
+        # cmd:  ocm backplane cloud credentials --output json {{ incident_get.json.incident.body.details.__pd_cef_payload.details.cluster_id }}
+        cmd: echo $AWS_TEMP_CREDS
+      register: aws_creds
+
+    - name: Log creds
+      ansible.builtin.debug:
+        msg: "{{ aws_creds.stdout | from_json }}"
+
+    - name: Get instances in state ["shutting-down", "stopping", "stopped"]
+      amazon.aws.ec2_instance_info:
+        aws_region: "{{ aws_region }}"
+        aws_access_key_id: "{{ aws_creds.stdout | from_json | community.general.json_query('AccessKeyID') }}"
+        aws_secret_access_key: "{{ aws_creds.stdout | from_json | community.general.json_query('SecretAccessKey') }}"
+        aws_session_token: "{{ aws_creds.stdout | from_json | community.general.json_query('SessionToken') }}"
+        filters:
+          instance-state-name: ["shutting-down", "stopping", "stopped", "terminated"]
+          state-reason-message: "Client.UserInitiatedShutdown: User initiated shutdown"
+          tag:Name: "*-master-*"
+      register: instances
+
+    - name: Print instance info
+      ansible.builtin.debug:
+        msg: "{{ instances }}"
+
+    # Get stop events during the last 12h from cloudtrail
+    # We can have different approaches when pulling and matching cloudtrail and ec2 info
+    # We can also decide that a stop/terminate event on a master is always limited support wihtout looking at the instances first
+    # It might in fact be better
+    # problems: timing&relevance for the issue at hand
+    - name: Get cloudtrail events
+      ansible.builtin.shell:
+        cmd: >
+          export AWS_ACCESS_KEY_ID="{{ aws_creds.stdout | from_json | community.general.json_query('AccessKeyID') }}"
+          && export AWS_SECRET_ACCESS_KEY="{{ aws_creds.stdout | from_json | community.general.json_query('SecretAccessKey') }}"
+          && export AWS_SESSION_TOKEN="{{ aws_creds.stdout | from_json | community.general.json_query('SessionToken') }}"
+          && aws cloudtrail lookup-events --region {{ aws_region }} --start-time $(date +%s -d "-12 hour")
+          --lookup-attributes AttributeKey=EventName,AttributeValue="StopInstances" --output json
+      register: events
+
+    - name: Print events
+      ansible.builtin.debug:
+        msg: "{{ events.stdout }}"
+
+    - name: Filter and match events
+      ansible.builtin.debug:
+        msg: "{{ events.stdout | from_json | community.general.json_query(query) }}"
+      loop: "{{ instances.instances }}"
+      vars:
+        query: 'Events[?Resources[?ResourceName == `{{ item.instance_id }}` ]].Username'
+      register: culprit_events
+
+    - name: Debug print
+      ansible.builtin.debug:
+        msg: "{{ item }}"
+      loop: "{{ culprit_events.results }}"
+
+    - name: Resolve incident on customer initiated shutdown of master nodes
+      community.general.pagerduty_alert:
+        integration_key: "{{ integration_key }}"
+        api_key: "{{ CAD_PD_API_KEY }}"
+        api_version: v2
+        service_id: P8M1LOH
+        state: resolved
+        incident_key: "{{ incident_key }}"
+        # In cad we would update pagerduty notes which is not possible with this module
+        # desc: "Customer '{{ item.msg }}' shutdown instances!"
+      # When username is not cluster automation
+      when: item.msg != 'openshift-machine-api-aws'
+      loop: "{{ culprit_events.results }}"
+
+    - name: Add pd notes
+      ansible.builtin.uri:
+        url: 'https://api.pagerduty.com/incidents/{{ incident_id }}/notes'
+        method: 'POST'
+        headers:
+          Authorization: Token token={{ CAD_PD_API_KEY }}
+          Accept: application/json
+          Content-Type: application/json
+          From: '{{ CAD_EMAIL }}'
+        body: '{"note": {"content": "{{ verifier-results }}"}}'
